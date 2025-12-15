@@ -348,7 +348,7 @@ app.delete('/orders/:id', authMiddleware, requireRoles('admin'), async (req: Aut
 });
 
 // ============= INVENTÁRIO =============
-app.get('/inventory', authMiddleware, requireRoles('almoxarifado', 'admin'), async (req: AuthRequest, res) => {
+app.get('/inventory', authMiddleware, async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   
   const { rows } = await pool.query(
