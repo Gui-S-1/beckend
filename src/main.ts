@@ -152,29 +152,76 @@ app.post('/auth/login', async (req, res) => {
 // ROTAS PROTEGIDAS (requerem autenticação)
 // =============================================
 
-// Exemplo: Listar ordens de serviço (requer role 'os')
-app.get('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: AuthRequest, res) => {
+// ============= USUÁRIOS =============
+// Listar todos os usuários do tenant
+app.get('/users', authMiddleware, async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   
-  // SQL injection protegido por parametrized query
   const { rows } = await pool.query(
-    `SELECT o.id, o.title, o.description, o.sector, o.priority, o.status,
-            o.started_at, o.finished_at, o.created_at,
-            u1.name AS requested_by_name,
-            u2.name AS assigned_to_name
-     FROM orders o
-     LEFT JOIN users u1 ON u1.id = o.requested_by
-     LEFT JOIN users u2 ON u2.id = o.assigned_to
-     WHERE o.tenant_id = $1
-     ORDER BY o.created_at DESC
-     LIMIT 100`,
+    `SELECT u.id, u.username, u.name, u.active, u.created_at,
+            ARRAY_AGG(r.code) AS roles
+     FROM users u
+     JOIN license_keys lk ON lk.id = u.key_id
+     LEFT JOIN key_roles kr ON kr.key_id = lk.id
+     LEFT JOIN roles r ON r.id = kr.role_id
+     WHERE lk.tenant_id = $1
+     GROUP BY u.id, u.username, u.name, u.active, u.created_at
+     ORDER BY u.name`,
     [tenantId]
   );
   
+  res.json({ ok: true, users: rows });
+});
+
+// ============= ORDENS DE SERVIÇO =============
+// Listar OS com filtros baseados em role
+app.get('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const userId = req.user!.id;
+  const userRoles = req.user!.roles || [];
+  const { status } = req.query;
+  
+  let query = `
+    SELECT o.id, o.title, o.description, o.sector, o.priority, o.status,
+           o.started_at, o.finished_at, o.created_at, o.updated_at,
+           u_req.name AS requested_by_name, u_req.id AS requested_by_id,
+           COALESCE(
+             json_agg(
+               json_build_object('id', u_ass.id, 'name', u_ass.name)
+             ) FILTER (WHERE u_ass.id IS NOT NULL), 
+             '[]'
+           ) AS assigned_to
+    FROM orders o
+    LEFT JOIN users u_req ON u_req.id = o.requested_by
+    LEFT JOIN order_assignments oa ON oa.order_id = o.id
+    LEFT JOIN users u_ass ON u_ass.id = oa.user_id
+    WHERE o.tenant_id = $1
+  `;
+  
+  const params: any[] = [tenantId];
+  
+  // Se não for admin, só vê suas próprias OS
+  if (!userRoles.includes('admin')) {
+    query += ` AND (o.requested_by = $2 OR oa.user_id = $2)`;
+    params.push(userId);
+  }
+  
+  // Filtro de status
+  if (status && typeof status === 'string') {
+    query += ` AND o.status = $${params.length + 1}`;
+    params.push(status);
+  }
+  
+  query += ` GROUP BY o.id, o.title, o.description, o.sector, o.priority, o.status,
+                      o.started_at, o.finished_at, o.created_at, o.updated_at,
+                      u_req.name, u_req.id
+             ORDER BY o.created_at DESC`;
+  
+  const { rows } = await pool.query(query, params);
   res.json({ ok: true, orders: rows });
 });
 
-// Criar ordem de serviço (requer role 'os')
+// Criar ordem de serviço
 app.post('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: AuthRequest, res) => {
   const schema = z.object({
     title: z.string().min(3).max(200),
@@ -195,11 +242,10 @@ app.post('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: Aut
   const { rows } = await pool.query(
     `INSERT INTO orders (tenant_id, title, description, sector, priority, requested_by, status)
      VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-     RETURNING id, title, status, created_at`,
+     RETURNING id, title, description, sector, priority, status, created_at`,
     [tenantId, title, description, sector, priority, userId]
   );
 
-  // Audit log
   await pool.query(
     `INSERT INTO audit_logs (tenant_id, user_id, action, table_name, record_id, meta)
      VALUES ($1, $2, 'create', 'orders', $3, $4)`,
@@ -209,7 +255,99 @@ app.post('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: Aut
   res.json({ ok: true, order: rows[0] });
 });
 
-// Exemplo: Inventário (requer role 'almoxarifado')
+// Atualizar status e responsáveis de uma OS
+app.patch('/orders/:id', authMiddleware, requireRoles('os', 'admin'), async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  const schema = z.object({
+    status: z.enum(['pending', 'in_progress', 'completed']).optional(),
+    assigned_to: z.array(z.string().uuid()).optional() // Array de user IDs
+  });
+  
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ ok: false, error: 'validation', details: parsed.error });
+  }
+
+  const { status, assigned_to } = parsed.data;
+  const tenantId = req.user!.tenant_id;
+  const userId = req.user!.id;
+  
+  // Verificar se a OS pertence ao tenant
+  const { rows: orderCheck } = await pool.query(
+    'SELECT id FROM orders WHERE id = $1 AND tenant_id = $2',
+    [id, tenantId]
+  );
+  
+  if (orderCheck.length === 0) {
+    return res.status(404).json({ ok: false, error: 'Order not found' });
+  }
+  
+  // Atualizar status
+  if (status) {
+    const now = new Date();
+    let updateQuery = 'UPDATE orders SET status = $1, updated_at = $2';
+    const updateParams: any[] = [status, now];
+    
+    // Se mudou para "in_progress", registra started_at
+    if (status === 'in_progress') {
+      updateQuery += ', started_at = COALESCE(started_at, $3)';
+      updateParams.push(now);
+    }
+    
+    // Se mudou para "completed", registra finished_at
+    if (status === 'completed') {
+      updateQuery += ', finished_at = $' + (updateParams.length + 1);
+      updateParams.push(now);
+    }
+    
+    updateQuery += ' WHERE id = $' + (updateParams.length + 1);
+    updateParams.push(id);
+    
+    await pool.query(updateQuery, updateParams);
+  }
+  
+  // Atualizar responsáveis
+  if (assigned_to) {
+    // Remover atribuições antigas
+    await pool.query('DELETE FROM order_assignments WHERE order_id = $1', [id]);
+    
+    // Adicionar novas atribuições
+    for (const assignedUserId of assigned_to) {
+      await pool.query(
+        'INSERT INTO order_assignments (order_id, user_id) VALUES ($1, $2)',
+        [id, assignedUserId]
+      );
+    }
+  }
+  
+  // Audit log
+  await pool.query(
+    `INSERT INTO audit_logs (tenant_id, user_id, action, table_name, record_id, meta)
+     VALUES ($1, $2, 'update', 'orders', $3, $4)`,
+    [tenantId, userId, id, JSON.stringify({ status, assigned_to })]
+  );
+  
+  res.json({ ok: true });
+});
+
+// Deletar OS (apenas admin)
+app.delete('/orders/:id', authMiddleware, requireRoles('admin'), async (req: AuthRequest, res) => {
+  const { id } = req.params;
+  const tenantId = req.user!.tenant_id;
+  
+  const { rowCount } = await pool.query(
+    'DELETE FROM orders WHERE id = $1 AND tenant_id = $2',
+    [id, tenantId]
+  );
+  
+  if (rowCount === 0) {
+    return res.status(404).json({ ok: false, error: 'Order not found' });
+  }
+  
+  res.json({ ok: true });
+});
+
+// ============= INVENTÁRIO =============
 app.get('/inventory', authMiddleware, requireRoles('almoxarifado', 'admin'), async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   
