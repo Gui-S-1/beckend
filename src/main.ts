@@ -352,7 +352,7 @@ app.get('/inventory', authMiddleware, async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   
   const { rows } = await pool.query(
-    `SELECT id, sku, name, quantity, unit, location, min_stock, updated_at
+    `SELECT id, sku, name, category, brand, quantity, unit, location, min_stock, specs, updated_at
      FROM inventory_items
      WHERE tenant_id = $1
      ORDER BY name`,
@@ -362,8 +362,294 @@ app.get('/inventory', authMiddleware, async (req: AuthRequest, res) => {
   res.json({ ok: true, items: rows });
 });
 
-wss.on('connection', (ws: import('ws').WebSocket) => {
-  ws.send(JSON.stringify({ type: 'welcome', msg: 'Icarus WS connected' }));
+app.post('/inventory', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const schema = z.object({
+    sku: z.string(),
+    name: z.string(),
+    category: z.string(),
+    brand: z.string().optional(),
+    quantity: z.number(),
+    unit: z.string(),
+    min_stock: z.number().optional(),
+    location: z.string().optional(),
+    specs: z.string().optional()
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+
+  const data = parsed.data;
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO inventory_items (tenant_id, sku, name, category, brand, quantity, unit, min_stock, location, specs)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id`,
+      [tenantId, data.sku, data.name, data.category, data.brand || null, data.quantity, data.unit, data.min_stock || 0, data.location || null, data.specs || null]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'inventory_create', { item_id: rows[0].id, sku: data.sku });
+    res.json({ ok: true, item_id: rows[0].id });
+  } catch (error: any) {
+    console.error('Erro ao criar item:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao criar item' });
+  }
+});
+
+app.put('/inventory/:id', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const itemId = parseInt(req.params.id);
+  const schema = z.object({ quantity: z.number() });
+  
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+
+  try {
+    await pool.query(
+      `UPDATE inventory_items SET quantity = $1, updated_at = NOW()
+       WHERE id = $2 AND tenant_id = $3`,
+      [parsed.data.quantity, itemId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'inventory_update', { item_id: itemId, new_quantity: parsed.data.quantity });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Erro ao atualizar item:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar item' });
+  }
+});
+
+app.delete('/inventory/:id', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const itemId = parseInt(req.params.id);
+
+  try {
+    await pool.query(
+      `DELETE FROM inventory_items WHERE id = $1 AND tenant_id = $2`,
+      [itemId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'inventory_delete', { item_id: itemId });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Erro ao excluir item:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao excluir item' });
+  }
+});
+
+// Purchases (Compras)
+app.get('/purchases', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  
+  const { rows } = await pool.query(
+    `SELECT p.*, u.username AS requested_by_name
+     FROM purchases p
+     LEFT JOIN users u ON u.id = p.requested_by
+     WHERE p.tenant_id = $1
+     ORDER BY p.created_at DESC`,
+    [tenantId]
+  );
+  
+  res.json({ ok: true, purchases: rows });
+});
+
+app.post('/purchases', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const userId = req.user!.id;
+  
+  const schema = z.object({
+    item_name: z.string(),
+    quantity: z.number(),
+    unit: z.string(),
+    unit_price: z.number().optional(),
+    total_cost: z.number().optional(),
+    supplier: z.string().optional(),
+    notes: z.string().optional()
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+
+  const data = parsed.data;
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO purchases (tenant_id, item_name, quantity, unit, unit_price, total_cost, supplier, notes, requested_by, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'analise')
+       RETURNING id`,
+      [tenantId, data.item_name, data.quantity, data.unit, data.unit_price || 0, data.total_cost || 0, data.supplier || null, data.notes || null, userId]
+    );
+
+    await auditLogger(pool, tenantId, userId, 'purchase_create', { purchase_id: rows[0].id });
+    res.json({ ok: true, purchase_id: rows[0].id });
+  } catch (error: any) {
+    console.error('Erro ao criar requisição:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao criar requisição' });
+  }
+});
+
+app.patch('/purchases/:id', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const purchaseId = parseInt(req.params.id);
+  const schema = z.object({ status: z.string() });
+  
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+
+  try {
+    await pool.query(
+      `UPDATE purchases SET status = $1 WHERE id = $2 AND tenant_id = $3`,
+      [parsed.data.status, purchaseId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'purchase_update', { purchase_id: purchaseId, new_status: parsed.data.status });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Erro ao atualizar requisição:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar requisição' });
+  }
+});
+
+app.delete('/purchases/:id', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const purchaseId = parseInt(req.params.id);
+
+  try {
+    await pool.query(
+      `DELETE FROM purchases WHERE id = $1 AND tenant_id = $2`,
+      [purchaseId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'purchase_delete', { purchase_id: purchaseId });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Erro ao excluir requisição:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao excluir requisição' });
+  }
+});
+
+// Preventives (Manutenções Preventivas)
+app.get('/preventives', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  
+  const { rows } = await pool.query(
+    `SELECT * FROM preventives WHERE tenant_id = $1 ORDER BY next_date`,
+    [tenantId]
+  );
+  
+  res.json({ ok: true, preventives: rows });
+});
+
+app.post('/preventives', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  
+  const schema = z.object({
+    equipment_name: z.string(),
+    maintenance_type: z.string(),
+    frequency: z.string(),
+    next_date: z.string(),
+    responsible: z.string().optional(),
+    checklist: z.string().optional()
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+
+  const data = parsed.data;
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO preventives (tenant_id, equipment_name, maintenance_type, frequency, next_date, responsible, checklist)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [tenantId, data.equipment_name, data.maintenance_type, data.frequency, data.next_date, data.responsible || null, data.checklist || null]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'preventive_create', { preventive_id: rows[0].id });
+    res.json({ ok: true, preventive_id: rows[0].id });
+  } catch (error: any) {
+    console.error('Erro ao criar preventiva:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao criar preventiva' });
+  }
+});
+
+app.post('/preventives/:id/complete', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const preventiveId = parseInt(req.params.id);
+
+  try {
+    // Buscar preventiva atual
+    const { rows } = await pool.query(
+      `SELECT frequency, next_date FROM preventives WHERE id = $1 AND tenant_id = $2`,
+      [preventiveId, tenantId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Preventiva não encontrada' });
+    }
+
+    const prev = rows[0];
+    const currentNext = new Date(prev.next_date);
+    let newNextDate = new Date(currentNext);
+
+    // Calcular próxima data baseado na frequência
+    switch (prev.frequency) {
+      case 'semanal':
+        newNextDate.setDate(newNextDate.getDate() + 7);
+        break;
+      case 'quinzenal':
+        newNextDate.setDate(newNextDate.getDate() + 14);
+        break;
+      case 'mensal':
+        newNextDate.setMonth(newNextDate.getMonth() + 1);
+        break;
+      case 'bimestral':
+        newNextDate.setMonth(newNextDate.getMonth() + 2);
+        break;
+      case 'trimestral':
+        newNextDate.setMonth(newNextDate.getMonth() + 3);
+        break;
+      case 'semestral':
+        newNextDate.setMonth(newNextDate.getMonth() + 6);
+        break;
+      case 'anual':
+        newNextDate.setFullYear(newNextDate.getFullYear() + 1);
+        break;
+    }
+
+    // Atualizar preventiva
+    await pool.query(
+      `UPDATE preventives 
+       SET last_date = CURRENT_DATE, next_date = $1, updated_at = NOW()
+       WHERE id = $2 AND tenant_id = $3`,
+      [newNextDate.toISOString().split('T')[0], preventiveId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'preventive_complete', { preventive_id: preventiveId, next_date: newNextDate });
+    res.json({ ok: true, next_date: newNextDate });
+  } catch (error: any) {
+    console.error('Erro ao concluir preventiva:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao concluir preventiva' });
+  }
+});
+
+app.delete('/preventives/:id', authMiddleware, async (req: AuthRequest, res) => {
+  const tenantId = req.user!.tenant_id;
+  const preventiveId = parseInt(req.params.id);
+
+  try {
+    await pool.query(
+      `DELETE FROM preventives WHERE id = $1 AND tenant_id = $2`,
+      [preventiveId, tenantId]
+    );
+
+    await auditLogger(pool, tenantId, req.user!.id, 'preventive_delete', { preventive_id: preventiveId });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Erro ao excluir preventiva:', error);
+    res.status(500).json({ ok: false, error: 'Erro ao excluir preventiva' });
+  }
 });
 
 const PORT = process.env.PORT || 8080;
