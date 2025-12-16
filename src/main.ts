@@ -28,6 +28,81 @@ const pool = new Pool({
   ssl: false  // Desabilitar SSL completamente para localhost
 });
 
+// Garantir que as tabelas/colunas usadas pelo app existam
+async function ensureSchema() {
+  // Inventário: colunas opcionais
+  await pool.query(`
+    ALTER TABLE inventory_items
+      ADD COLUMN IF NOT EXISTS category TEXT,
+      ADD COLUMN IF NOT EXISTS brand TEXT,
+      ADD COLUMN IF NOT EXISTS specs TEXT,
+      ADD COLUMN IF NOT EXISTS unit TEXT,
+      ADD COLUMN IF NOT EXISTS min_stock INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS max_stock INTEGER,
+      ADD COLUMN IF NOT EXISTS location TEXT;
+  `);
+
+  // Ordens de serviço: campo de comentário/progresso e coluna assigned_to
+  await pool.query(`
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS progress_note TEXT,
+      ADD COLUMN IF NOT EXISTS assigned_to UUID REFERENCES users(id);
+  `);
+
+  // Compras: compatível com o modelo usado no frontend
+  await pool.query(`
+    ALTER TABLE purchases
+      ADD COLUMN IF NOT EXISTS item_name TEXT,
+      ADD COLUMN IF NOT EXISTS quantity INTEGER,
+      ADD COLUMN IF NOT EXISTS unit TEXT,
+      ADD COLUMN IF NOT EXISTS unit_price NUMERIC(10,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS total_cost NUMERIC(10,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS notes TEXT,
+      ADD COLUMN IF NOT EXISTS requested_by UUID REFERENCES users(id),
+      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'analise',
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+  `);
+
+  // Preventivas: criar tabela se ainda não existir (usada pelo frontend)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS preventives (
+      id SERIAL PRIMARY KEY,
+      tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      equipment_name TEXT NOT NULL,
+      maintenance_type TEXT NOT NULL,
+      frequency TEXT NOT NULL,
+      next_date DATE,
+      responsible TEXT,
+      checklist TEXT,
+      last_date DATE,
+      status TEXT DEFAULT 'scheduled',
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+}
+
+// Limpar registros antigos (OS e compras) com mais de 60 dias
+async function pruneOldRecords() {
+  try {
+    await pool.query(`DELETE FROM orders WHERE created_at < NOW() - INTERVAL '60 days'`);
+    await pool.query(`DELETE FROM purchases WHERE created_at < NOW() - INTERVAL '60 days'`);
+  } catch (err) {
+    console.error('Erro ao remover registros antigos:', err);
+  }
+}
+
+// Executar compatibilização do schema e limpeza inicial
+ensureSchema()
+  .then(pruneOldRecords)
+  .catch((err) => {
+    console.error('Erro ao ajustar schema:', err);
+  });
+
+// Rotina diária para limpar dados com mais de 60 dias
+setInterval(pruneOldRecords, 24 * 60 * 60 * 1000);
+
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 // Key validation (licença)
@@ -176,49 +251,53 @@ app.get('/users', authMiddleware, async (req: AuthRequest, res) => {
 // ============= ORDENS DE SERVIÇO =============
 // Listar OS com filtros baseados em role
 app.get('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: AuthRequest, res) => {
-  const tenantId = req.user!.tenant_id;
-  const userId = req.user!.id;
-  const userRoles = req.user!.roles || [];
-  const { status } = req.query;
-  
-  let query = `
-    SELECT o.id, o.title, o.description, o.sector, o.priority, o.status,
-           o.started_at, o.finished_at, o.created_at, o.updated_at,
-           u_req.name AS requested_by_name, u_req.id AS requested_by_id,
-           COALESCE(
-             json_agg(
-               json_build_object('id', u_ass.id, 'name', u_ass.name)
-             ) FILTER (WHERE u_ass.id IS NOT NULL), 
-             '[]'
-           ) AS assigned_to
-    FROM orders o
-    LEFT JOIN users u_req ON u_req.id = o.requested_by
-    LEFT JOIN order_assignments oa ON oa.order_id = o.id
-    LEFT JOIN users u_ass ON u_ass.id = oa.user_id
-    WHERE o.tenant_id = $1
-  `;
-  
-  const params: any[] = [tenantId];
-  
-  // Se não for admin, só vê suas próprias OS
-  if (!userRoles.includes('admin')) {
-    query += ` AND (o.requested_by = $2 OR oa.user_id = $2)`;
-    params.push(userId);
+  try {
+    const tenantId = req.user!.tenant_id;
+    const userId = req.user!.id;
+    const userRoles = req.user!.roles || [];
+    const { status } = req.query;
+
+    const params: any[] = [tenantId];
+    let query = `
+      SELECT o.id, o.title, o.description, o.sector, o.priority, o.status,
+             o.started_at, o.finished_at, o.created_at, o.updated_at,
+             o.requested_by,
+              o.progress_note,
+             u_req.name AS requested_by_name, u_req.username AS requested_by_username,
+             COALESCE(
+               json_agg(
+                 json_build_object('id', u_ass.id, 'name', u_ass.name, 'username', u_ass.username)
+               ) FILTER (WHERE u_ass.id IS NOT NULL),
+               '[]'
+             ) AS assigned_users
+      FROM orders o
+      LEFT JOIN users u_req ON u_req.id = o.requested_by
+      LEFT JOIN users u_ass ON u_ass.id = o.assigned_to
+      WHERE o.tenant_id = $1 AND o.created_at >= NOW() - INTERVAL '60 days'
+    `;
+
+    // Se não for admin, limita ao que solicitou ou recebeu
+    if (!userRoles.includes('admin')) {
+      query += ' AND (o.requested_by = $2 OR o.assigned_to = $2)';
+      params.push(userId);
+    }
+
+    if (status && typeof status === 'string') {
+      query += ` AND o.status = $${params.length + 1}`;
+      params.push(status);
+    }
+
+    query += ` GROUP BY o.id, o.title, o.description, o.sector, o.priority, o.status,
+                        o.started_at, o.finished_at, o.created_at, o.updated_at,
+                        o.requested_by, o.progress_note, u_req.name, u_req.username
+               ORDER BY o.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+    res.json({ ok: true, orders: rows });
+  } catch (error) {
+    console.error('Erro ao listar OS:', error);
+    res.status(500).json({ ok: false, error: 'internal_error' });
   }
-  
-  // Filtro de status
-  if (status && typeof status === 'string') {
-    query += ` AND o.status = $${params.length + 1}`;
-    params.push(status);
-  }
-  
-  query += ` GROUP BY o.id, o.title, o.description, o.sector, o.priority, o.status,
-                      o.started_at, o.finished_at, o.created_at, o.updated_at,
-                      u_req.name, u_req.id
-             ORDER BY o.created_at DESC`;
-  
-  const { rows } = await pool.query(query, params);
-  res.json({ ok: true, orders: rows });
 });
 
 // Criar ordem de serviço
@@ -227,32 +306,40 @@ app.post('/orders', authMiddleware, requireRoles('os', 'admin'), async (req: Aut
     title: z.string().min(3).max(200),
     description: z.string().optional(),
     sector: z.string().optional(),
-    priority: z.enum(['low', 'medium', 'high', 'urgent']).default('medium')
+    priority: z.enum(['low', 'medium', 'high', 'urgent']).default('medium'),
+    assigned_user_ids: z.array(z.string().uuid()).optional(),
+    progress_note: z.string().optional()
   });
-  
+
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ ok: false, error: 'validation', details: parsed.error });
   }
 
-  const { title, description, sector, priority } = parsed.data;
+  const { title, description, sector, priority, assigned_user_ids, progress_note } = parsed.data;
   const tenantId = req.user!.tenant_id;
   const userId = req.user!.id;
+  const assignedTo = assigned_user_ids?.[0] || null;
 
-  const { rows } = await pool.query(
-    `INSERT INTO orders (tenant_id, title, description, sector, priority, requested_by, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-     RETURNING id, title, description, sector, priority, status, created_at`,
-    [tenantId, title, description, sector, priority, userId]
-  );
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO orders (tenant_id, title, description, sector, priority, status, requested_by, assigned_to, progress_note)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+       RETURNING id, title, description, sector, priority, status, created_at, assigned_to, progress_note`,
+      [tenantId, title, description, sector, priority, userId, assignedTo, progress_note || null]
+    );
 
-  await pool.query(
-    `INSERT INTO audit_logs (tenant_id, user_id, action, table_name, record_id, meta)
-     VALUES ($1, $2, 'create', 'orders', $3, $4)`,
-    [tenantId, userId, rows[0].id, JSON.stringify({ title })]
-  );
+    await pool.query(
+      `INSERT INTO audit_logs (tenant_id, user_id, action, table_name, record_id, meta)
+       VALUES ($1, $2, 'create', 'orders', $3, $4)`,
+      [tenantId, userId, rows[0].id, JSON.stringify({ title, assigned_to: assignedTo })]
+    );
 
-  res.json({ ok: true, order: rows[0] });
+    res.json({ ok: true, order: rows[0] });
+  } catch (error) {
+    console.error('Erro ao criar OS:', error);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
 });
 
 // Atualizar status e responsáveis de uma OS
@@ -260,73 +347,61 @@ app.patch('/orders/:id', authMiddleware, requireRoles('os', 'admin'), async (req
   const { id } = req.params;
   const schema = z.object({
     status: z.enum(['pending', 'in_progress', 'completed']).optional(),
-    assigned_to: z.array(z.string().uuid()).optional() // Array de user IDs
+    assigned_user_ids: z.array(z.string().uuid()).optional(),
+    progress_note: z.string().optional()
   });
-  
+
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ ok: false, error: 'validation', details: parsed.error });
   }
 
-  const { status, assigned_to } = parsed.data;
+  const { status, assigned_user_ids, progress_note } = parsed.data;
   const tenantId = req.user!.tenant_id;
   const userId = req.user!.id;
-  
+  const assignedTo = assigned_user_ids?.[0] || null;
+
   // Verificar se a OS pertence ao tenant
   const { rows: orderCheck } = await pool.query(
     'SELECT id FROM orders WHERE id = $1 AND tenant_id = $2',
     [id, tenantId]
   );
-  
+
   if (orderCheck.length === 0) {
     return res.status(404).json({ ok: false, error: 'Order not found' });
   }
-  
-  // Atualizar status
+
   if (status) {
     const now = new Date();
     let updateQuery = 'UPDATE orders SET status = $1, updated_at = $2';
     const updateParams: any[] = [status, now];
-    
-    // Se mudou para "in_progress", registra started_at
+
     if (status === 'in_progress') {
       updateQuery += ', started_at = COALESCE(started_at, $3)';
       updateParams.push(now);
     }
-    
-    // Se mudou para "completed", registra finished_at
+
     if (status === 'completed') {
       updateQuery += ', finished_at = $' + (updateParams.length + 1);
       updateParams.push(now);
     }
-    
+
     updateQuery += ' WHERE id = $' + (updateParams.length + 1);
     updateParams.push(id);
-    
+
     await pool.query(updateQuery, updateParams);
   }
-  
-  // Atualizar responsáveis
-  if (assigned_to) {
-    // Remover atribuições antigas
-    await pool.query('DELETE FROM order_assignments WHERE order_id = $1', [id]);
-    
-    // Adicionar novas atribuições
-    for (const assignedUserId of assigned_to) {
-      await pool.query(
-        'INSERT INTO order_assignments (order_id, user_id) VALUES ($1, $2)',
-        [id, assignedUserId]
-      );
-    }
+
+  if (assigned_user_ids || progress_note !== undefined) {
+    await pool.query('UPDATE orders SET assigned_to = COALESCE($1, assigned_to), progress_note = COALESCE($2, progress_note) WHERE id = $3', [assignedTo, progress_note ?? null, id]);
   }
-  
-  // Audit log
+
   await pool.query(
     `INSERT INTO audit_logs (tenant_id, user_id, action, table_name, record_id, meta)
      VALUES ($1, $2, 'update', 'orders', $3, $4)`,
-    [tenantId, userId, id, JSON.stringify({ status, assigned_to })]
+    [tenantId, userId, id, JSON.stringify({ status, assigned_to: assignedTo, progress_note })]
   );
-  
+
   res.json({ ok: true });
 });
 
@@ -352,7 +427,7 @@ app.get('/inventory', authMiddleware, async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   
   const { rows } = await pool.query(
-    `SELECT id, sku, name, category, brand, quantity, unit, location, min_stock, specs, updated_at
+    `SELECT id, sku, name, category, brand, quantity, unit, location, min_stock, max_stock, specs, updated_at
      FROM inventory_items
      WHERE tenant_id = $1
      ORDER BY name`,
@@ -372,6 +447,7 @@ app.post('/inventory', authMiddleware, async (req: AuthRequest, res) => {
     quantity: z.number(),
     unit: z.string(),
     min_stock: z.number().optional(),
+    max_stock: z.number().optional(),
     location: z.string().optional(),
     specs: z.string().optional()
   });
@@ -383,10 +459,10 @@ app.post('/inventory', authMiddleware, async (req: AuthRequest, res) => {
   
   try {
     const { rows } = await pool.query(
-      `INSERT INTO inventory_items (tenant_id, sku, name, category, brand, quantity, unit, min_stock, location, specs)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO inventory_items (tenant_id, sku, name, category, brand, quantity, unit, min_stock, max_stock, location, specs)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
-      [tenantId, data.sku, data.name, data.category, data.brand || null, data.quantity, data.unit, data.min_stock || 0, data.location || null, data.specs || null]
+      [tenantId, data.sku, data.name, data.category, data.brand || null, data.quantity, data.unit, data.min_stock || 0, data.max_stock || null, data.location || null, data.specs || null]
     );
 
     await auditLogger(pool, tenantId, req.user!.id, 'inventory_create', { item_id: rows[0].id, sku: data.sku });
@@ -400,16 +476,20 @@ app.post('/inventory', authMiddleware, async (req: AuthRequest, res) => {
 app.put('/inventory/:id', authMiddleware, async (req: AuthRequest, res) => {
   const tenantId = req.user!.tenant_id;
   const itemId = parseInt(req.params.id);
-  const schema = z.object({ quantity: z.number() });
+  const schema = z.object({
+    quantity: z.number(),
+    min_stock: z.number().optional(),
+    max_stock: z.number().optional()
+  });
   
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ ok: false, error: 'Dados inválidos' });
 
   try {
     await pool.query(
-      `UPDATE inventory_items SET quantity = $1, updated_at = NOW()
-       WHERE id = $2 AND tenant_id = $3`,
-      [parsed.data.quantity, itemId, tenantId]
+      `UPDATE inventory_items SET quantity = $1, min_stock = COALESCE($2, min_stock), max_stock = COALESCE($3, max_stock), updated_at = NOW()
+       WHERE id = $4 AND tenant_id = $5`,
+      [parsed.data.quantity, parsed.data.min_stock ?? null, parsed.data.max_stock ?? null, itemId, tenantId]
     );
 
     await auditLogger(pool, tenantId, req.user!.id, 'inventory_update', { item_id: itemId, new_quantity: parsed.data.quantity });
@@ -446,7 +526,7 @@ app.get('/purchases', authMiddleware, async (req: AuthRequest, res) => {
     `SELECT p.*, u.username AS requested_by_name
      FROM purchases p
      LEFT JOIN users u ON u.id = p.requested_by
-     WHERE p.tenant_id = $1
+     WHERE p.tenant_id = $1 AND p.created_at >= NOW() - INTERVAL '60 days'
      ORDER BY p.created_at DESC`,
     [tenantId]
   );
@@ -499,7 +579,7 @@ app.patch('/purchases/:id', authMiddleware, async (req: AuthRequest, res) => {
 
   try {
     await pool.query(
-      `UPDATE purchases SET status = $1 WHERE id = $2 AND tenant_id = $3`,
+      `UPDATE purchases SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`,
       [parsed.data.status, purchaseId, tenantId]
     );
 
